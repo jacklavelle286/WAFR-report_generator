@@ -148,8 +148,8 @@ Resources:
                   for lens_alias in lenses:
                       next_token = None
                       while True:
-                          # Include the NextToken in the request if it's present
                           if next_token:
+                              # Include the NextToken in the request if it's present
                               response = wa_client.list_answers(WorkloadId=workload_id, LensAlias=lens_alias, NextToken=next_token)
                           else:
                               response = wa_client.list_answers(WorkloadId=workload_id, LensAlias=lens_alias)
@@ -173,17 +173,22 @@ Resources:
                                   )
                                   logger.info(f"Processed {risk} risk answer for question {question_id} for lens {lens_alias} in workload {workload_id}")
 
-                          # Check for a NextToken in the response and break the loop if not present
                           next_token = response.get('NextToken')
                           if not next_token:
                               break
 
               except Exception as e:
                   logger.error(f"Error processing workload {workload_id}: {str(e)}")
-                  return {'statusCode': 500, 'body': json.dumps(f"Error processing workload {workload_id}: {str(e)}")}
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f"Error processing workload {workload_id}: {str(e)}"})
+                  }
 
-              return {'statusCode': 200, 'body': json.dumps(f"Successfully processed high and medium risk questions for workload {workload_id}.")}
-
+              # Return workload_id in a structured JSON format
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': f"Successfully processed high and medium risk questions for workload {workload_id}.", 'workload_id': workload_id})
+              }
 
       Handler: index.lambda_handler
       Role: !GetAtt PutDynamoDBLambdaRole.Arn 
@@ -255,26 +260,42 @@ Resources:
           import csv
           import io
           import os
+          import json
+          import logging
+
+          # Initialize logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
 
           def lambda_handler(event, context):
-              # Extract the Workload ID from the event
-              workload_id = event['workload_id']
+              logger.info(f"Received event: {event}")
+              
+              # Parse the event as JSON and extract the Workload ID
+              event_data = json.loads(event['body'])
+              workload_id = event_data['workload_id']
+              logger.info(f"Extracted workload_id: {workload_id}")
 
               # Initialize AWS clients
               dynamodb = boto3.resource('dynamodb')
               s3 = boto3.client('s3')
+              logger.info("Initialized AWS clients")
 
               # Reference the DynamoDB table
               table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
-
+              logger.info(f"Referenced DynamoDB table: {os.environ['DYNAMODB_TABLE']}")
 
               # Query the table for items related to the provided Workload ID
-              response = table.query(
-                  KeyConditionExpression='WorkloadId = :workload_id',
-                  ExpressionAttributeValues={
-                      ':workload_id': workload_id
-                  }
-              )
+              try:
+                  response = table.query(
+                      KeyConditionExpression='WorkloadId = :workload_id',
+                      ExpressionAttributeValues={
+                          ':workload_id': workload_id
+                      }
+                  )
+                  logger.info(f"Queried DynamoDB table. Items count: {len(response['Items'])}")
+              except Exception as e:
+                  logger.error(f"Error querying DynamoDB: {str(e)}")
+                  raise
 
               # Generate CSV content
               csv_content = io.StringIO()
@@ -283,19 +304,28 @@ Resources:
 
               for item in response['Items']:
                   csv_writer.writerow([item['WorkloadId'], item['QuestionId'], item['Risk'], item['SelectedChoices'], item['Notes']])
+              logger.info("CSV content generated")
 
               # Upload CSV to S3 bucket
-              s3.put_object(
-                  Bucket=os.environ['CSV_BUCKET'],
-                  Key=f'{workload_id}.csv',
-                  Body=csv_content.getvalue()
-              )
+              try:
+                  s3.put_object(
+                      Bucket=os.environ['CSV_BUCKET'],
+                      Key=f'{workload_id}.csv',
+                      Body=csv_content.getvalue()
+                  )
+                  logger.info(f"CSV uploaded to S3 bucket: {os.environ['CSV_BUCKET']}, Key: {workload_id}.csv")
+              except Exception as e:
+                  logger.error(f"Error uploading CSV to S3: {str(e)}")
+                  raise
 
               # Return the S3 path of the uploaded CSV as output
-              return {
+              result = {
                   'statusCode': 200,
-                  'csv_s3_key': f'{workload_id}.csv'
+                  'csv_s3_key': f'{workload_id}.csv',
+                  'workload_id': workload_id  # Pass the workload_id to the next function
               }
+              logger.info(f"Function output: {result}")
+              return result
 
   GenerateFullReportLambdaRole:
     Type: AWS::IAM::Role
@@ -347,52 +377,76 @@ Resources:
       FunctionName: "generateFullReportLambda"
       Layers:
         - arn:aws:lambda:us-east-1:770693421928:layer:Klayers-p311-python-docx:3
+        - arn:aws:lambda:us-east-1:770693421928:layer:Klayers-p311-matplotlib:5
       Code:
         ZipFile: |
           import boto3
           import csv
           import io
           import os
+          import matplotlib.pyplot as plt
           from docx import Document
-          from docx.shared import RGBColor
+          from docx.shared import RGBColor, Inches
           from datetime import datetime
           import json
+          import logging
+
+          # Initialize logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
 
           def lambda_handler(event, context):
+              logger.info("Starting Lambda execution.")
+              logger.debug(f"Received event: {json.dumps(event)}")
+
               # Define the S3 bucket names and file names from environment variables
               template_bucket = os.environ['TEMPLATE_BUCKET']
               csv_bucket = os.environ['CSV_BUCKET']
               output_bucket = os.environ['DESTINATION_BUCKET']
-              csv_file_name = event['csv_file_name']
+              csv_file_name = event['csv_s3_key']
               template_file_name = os.environ['TEMPLATE_FILE']
+
+              logger.info(f"Template bucket: {template_bucket}, CSV bucket: {csv_bucket}, Output bucket: {output_bucket}")
 
               # Initialize S3 and Well-Architected client
               s3 = boto3.client('s3')
               wa_client = boto3.client('wellarchitected')
 
+              # Download the CSV file from S3 and parse its content
+              logger.info("Downloading CSV file from S3.")
+              csv_object = s3.get_object(Bucket=csv_bucket, Key=csv_file_name)
+              csv_content = csv_object['Body'].read().decode('utf-8')
+              risks_per_pillar, high_risk_items, medium_risk_items, workload_id = parse_csv_and_fetch_details(csv_content, wa_client)
+
+              # Generate the graph and get its file path
+              graph_image_path = generate_risk_graph(risks_per_pillar)
+
               # Download the template file from S3
+              logger.info("Downloading template document from S3.")
               s3.download_file(template_bucket, template_file_name, '/tmp/template.docx')
               document = Document('/tmp/template.docx')
 
-              # Download the CSV file from S3 and parse its content
-              csv_object = s3.get_object(Bucket=csv_bucket, Key=csv_file_name)
-              csv_content = csv_object['Body'].read().decode('utf-8')
-              high_risk_items, medium_risk_items, workload_id = parse_csv_and_fetch_details(csv_content, wa_client)
+              # Replace the placeholders with high and medium risk items
+              replace_risk_placeholders(document, high_risk_items, medium_risk_items)
+
+              # Replace the {{pillargraph}} placeholder with the graph
+              replace_graph_placeholders(document, graph_image_path)
 
               # Construct the report filename with the workload_id and current date
               date_str = datetime.now().strftime("%d.%m.%Y")
               report_filename = f"{date_str}-{workload_id}-report.docx"
 
-              # Replace placeholders in the template with CSV data and set text color to white
-              replace_placeholders(document, high_risk_items, medium_risk_items)
-
               # Save the modified document
+              logger.info("Saving the modified document.")
               modified_file_path = '/tmp/modified_template.docx'
               document.save(modified_file_path)
 
               # Upload the modified document to the output S3 bucket
+              logger.info("Uploading the modified document to S3.")
               with open(modified_file_path, 'rb') as modified_file:
                   s3.upload_fileobj(modified_file, output_bucket, report_filename)
+
+              logger.info(f"Report successfully generated and uploaded. Filename: {report_filename}")
 
               return {
                   'statusCode': 200,
@@ -404,49 +458,96 @@ Resources:
                   })
               }
 
+
+
           def parse_csv_and_fetch_details(csv_content, wa_client):
+              logger.info("Parsing CSV and fetching details.")
+              risks_per_pillar = {}  # {pillar: {"HIGH": count, "MEDIUM": count}}
               high_risk_items = []
               medium_risk_items = []
-              workload_id = None  # Initialize workload_id
+              workload_id = None
+
               csv_reader = csv.DictReader(io.StringIO(csv_content))
 
               for row in csv_reader:
                   if not workload_id:
-                      workload_id = row['WorkloadId']  # Set the workload_id from the first row
+                      workload_id = row['WorkloadId']  # Extract workload_id from the first row
+
                   question_details = wa_client.get_answer(
                       WorkloadId=row['WorkloadId'],
                       LensAlias='wellarchitected',
                       QuestionId=row['QuestionId']
                   )
-                  question_text = question_details['Answer']['QuestionTitle']
                   pillar_id = format_pillar_id(question_details['Answer']['PillarId'])
+                  risk = row['Risk']
+                  question_text = question_details['Answer']['QuestionTitle']
 
+                  # Format the text for high and medium risk items
                   formatted_text = f"{pillar_id}: {question_text}, Notes: {row['Notes']}"
-                  if row['Risk'] == 'HIGH':
-                      high_risk_items.append(formatted_text)
-                  elif row['Risk'] == 'MEDIUM':
-                      medium_risk_items.append(formatted_text)
 
-              return high_risk_items, medium_risk_items, workload_id
+                  if risk == 'HIGH':
+                      high_risk_items.append(formatted_text)
+                      risks_per_pillar.setdefault(pillar_id, {"HIGH": 0, "MEDIUM": 0})["HIGH"] += 1
+                  elif risk == 'MEDIUM':
+                      medium_risk_items.append(formatted_text)
+                      risks_per_pillar.setdefault(pillar_id, {"HIGH": 0, "MEDIUM": 0})["MEDIUM"] += 1
+
+              return risks_per_pillar, high_risk_items, medium_risk_items, workload_id
+
 
           def format_pillar_id(pillar_id):
-              # Special formatting for certain pillar IDs
+              logger.debug(f"Formatting pillar ID: {pillar_id}")
               if pillar_id.lower() == 'costoptimization':
                   return 'Cost Optimization'
               elif pillar_id.lower() == 'operationalexcellence':
                   return 'Operational Excellence'
               else:
-                  # General formatting for other pillar IDs
                   return ' '.join(word.capitalize() for word in pillar_id.split())
+                  
+          def generate_risk_graph(risks_per_pillar):
+              pillars = list(risks_per_pillar.keys())
+              high_risks = [risks_per_pillar[pillar]["HIGH"] for pillar in pillars]
+              medium_risks = [risks_per_pillar[pillar]["MEDIUM"] for pillar in pillars]
 
-          def replace_placeholders(document, high_risk_items, medium_risk_items):
+              x = list(range(len(pillars)))  # Convert range to list for arithmetic operations
+              width = 0.35  # the width of the bars
+
+              fig, ax = plt.subplots()
+              rects1 = ax.bar([pos - width/2 for pos in x], high_risks, width, label='High Risk')  # Adjust x positions for high risk bars
+              rects2 = ax.bar([pos + width/2 for pos in x], medium_risks, width, label='Medium Risk')  # Adjust x positions for medium risk bars
+
+              ax.set_ylabel('Counts')
+              ax.set_title('Risks by Pillar')
+              ax.set_xticks(x)
+              ax.set_xticklabels(pillars, rotation=45)  # Rotate labels if they overlap
+              ax.legend()
+
+              fig.tight_layout()
+
+              graph_image_path = '/tmp/risk_graph.png'
+              plt.savefig(graph_image_path)
+              plt.close(fig)  # Close the plot to free up memory
+
+              return graph_image_path
+
+          def replace_graph_placeholders(document, graph_image_path):
+              logger.info("Replacing placeholders in the document.")
               for paragraph in document.paragraphs:
-                  if '{{highrisk}}' in paragraph.text:
-                      replace_paragraph_text_with_color(paragraph, "{{highrisk}}", "\n".join(high_risk_items))
-                  elif '{{mediumrisk}}' in paragraph.text:
-                      replace_paragraph_text_with_color(paragraph, "{{mediumrisk}}", "\n".join(medium_risk_items))
+                  if '{{pillargraph}}' in paragraph.text:
+                      paragraph.clear()  # Clear the placeholder text
+                      run = paragraph.add_run()  # Add a new run in the paragraph
+                      run.add_picture(graph_image_path, width=Inches(4))  # Insert the graph image
+                      break  # Assuming there's only one placeholder
+                  
+          def replace_risk_placeholders(document, high_risk_items, medium_risk_items):
+                        for paragraph in document.paragraphs:
+                            if '{{highrisk}}' in paragraph.text:
+                                replace_paragraph_text_with_color(paragraph, "{{highrisk}}", "\n".join(high_risk_items))
+                            elif '{{mediumrisk}}' in paragraph.text:
+                                replace_paragraph_text_with_color(paragraph, "{{mediumrisk}}", "\n".join(medium_risk_items))
 
           def replace_paragraph_text_with_color(paragraph, placeholder, new_text):
+              logger.debug(f"Replacing text for placeholder: {placeholder}")
               # Clear existing paragraph text
               paragraph.clear()
 
@@ -457,12 +558,15 @@ Resources:
               font = run.font
               font.color.rgb = RGBColor(255, 255, 255)
 
+              logger.info("Replacement complete.")
+
+
+
       Handler: index.lambda_handler
       Role: !GetAtt GenerateFullReportLambdaRole.Arn 
       Runtime: python3.11
       Timeout: 300
           
-# everything below will be the presigned url function and role
 
   PresignedUrlRole:
     Type: AWS::IAM::Role
@@ -508,69 +612,134 @@ Resources:
         ZipFile: |
           import boto3
           import os
+          import json
+          import logging
+
+          # Initialize logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
 
           def lambda_handler(event, context):
+              logger.info(f"Received event: {event}")
+              
+              # Parse the 'body' field from the event to get a dictionary
+              body = json.loads(event['body'])
+              logger.info(f"Parsed body: {body}")
+
+              # Use the parsed 'body' to extract 's3Bucket' and 'reportFilename'
+              bucket_name = body['s3Bucket']
+              object_key = body['reportFilename']
+              logger.info(f"Extracted bucket name: {bucket_name} and object key: {object_key}")
+
+              # Initialize S3 and SNS clients
               s3_client = boto3.client('s3')
               sns_client = boto3.client('sns')
               sns_topic_arn = os.environ['SNS_TOPIC']
-
-              # Extract bucket name and object key from the event
-              bucket_name = event['s3Bucket']
-              object_key = event['reportFilename']
+              logger.info("Initialized S3 and SNS clients")
 
               # Generate a presigned URL for the report
-              presigned_url = s3_client.generate_presigned_url('get_object',
-                                                                Params={'Bucket': bucket_name, 'Key': object_key},
-                                                                ExpiresIn=3600)  # URL expires in 1 hour
+              try:
+                  presigned_url = s3_client.generate_presigned_url('get_object',
+                                                                  Params={'Bucket': bucket_name, 'Key': object_key},
+                                                                  ExpiresIn=3600)  # URL expires in 1 hour
+                  logger.info(f"Generated presigned URL: {presigned_url}")
+              except Exception as e:
+                  logger.error(f"Error generating presigned URL: {str(e)}")
+                  raise
 
               # Publish the presigned URL to an SNS topic
-              sns_response = sns_client.publish(
-                  TopicArn=sns_topic_arn,
-                  Message=f'New report available: {presigned_url}',
-                  Subject='New Report Available'
-              )
+              try:
+                  sns_response = sns_client.publish(
+                      TopicArn=sns_topic_arn,
+                      Message=f'New report available: {presigned_url}',
+                      Subject='New Report Available'
+                  )
+                  logger.info(f"Published presigned URL to SNS topic. SNS Message ID: {sns_response['MessageId']}")
+              except Exception as e:
+                  logger.error(f"Error publishing to SNS topic: {str(e)}")
+                  raise
 
               return {
                   'statusCode': 200,
                   'body': f"Presigned URL published to SNS topic. SNS Message ID: {sns_response['MessageId']}"
               }
 
-                    import boto3
-                    import urllib.parse
-                    from datetime import datetime, timedelta
-                    import os
-
-                    def lambda_handler(event, context):
-                        s3_client = boto3.client('s3')
-                        sns_client = boto3.client('sns')
-                        sns_topic = os.environ['SNS_TOPIC']
-
-                        # Extract bucket name and object key from the event
-                        bucket_name = event['Records'][0]['s3']['bucket']['name']
-                        object_key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
-
-                        # Generate a presigned URL for the report
-                        presigned_url = s3_client.generate_presigned_url('get_object',
-                                                                          Params={'Bucket': bucket_name, 'Key': object_key},
-                                                                          ExpiresIn=3600)  # URL expires in 1 hour
-
-                        # Publish the presigned URL to an SNS topic
-                        sns_topic_arn = 'sns_topic'
-                        sns_response = sns_client.publish(
-                            TopicArn=sns_topic_arn,
-                            Message=f'New report available: {presigned_url}',
-                            Subject='New Report Available'
-                        )
-
-                        return {
-                            'statusCode': 200,
-                            'body': f"Presigned URL published to SNS topic. SNS Message ID: {sns_response['MessageId']}"
-                        }
 
       Handler: index.lambda_handler
       Role: !GetAtt PresignedUrlRole.Arn
       Runtime: python3.12
       Timeout: 300
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "states.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "StepFunctionsLambdaExecutionPolicy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+
+  WellArchitectedWorkflow:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "A workflow to generate a report for a Well-Architected Review and distribute it",
+          "StartAt": "PutDynamoDBData",
+          "States": {
+            "PutDynamoDBData": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:putDynamoDBLambda",
+              "Next": "GenerateCSV"
+            },
+            "GenerateCSV": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:generateCSVLambda",
+              "Next": "GenerateFullReport"
+            },
+            "GenerateFullReport": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:generateFullReportLambda",
+              "Next": "GeneratePresignedURL"
+            },
+            "GeneratePresignedURL": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:PresignedReportLambda",
+              "End": true
+            }
+          }
+        }
+
+  EventBridgeRoleForStepFunctions:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "events.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "InvokeStepFunctionsPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "states:StartExecution"
+                Resource: !GetAtt WellArchitectedWorkflow.Arn
 
 
   NewMilestoneRule:
@@ -596,18 +765,7 @@ Resources:
 
       State: "ENABLED"
       Targets:
-        - Arn: !GetAtt PutDynamoDBLambda.Arn
-          Id: "GenerateInitialReportRule"
-
-  
-  LambdaInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt PutDynamoDBLambda.Arn
-      Action: "lambda:InvokeFunction"
-      Principal: "events.amazonaws.com"
-      SourceArn: !GetAtt NewMilestoneRule.Arn
-    DependsOn:
-      - NewMilestoneRule
-      - PutDynamoDBLambda
+        - Arn: !GetAtt WellArchitectedWorkflow.Arn
+          Id: "WellArchitectedWorkflowTarget"
+          RoleArn: !GetAtt EventBridgeRoleForStepFunctions.Arn
 
