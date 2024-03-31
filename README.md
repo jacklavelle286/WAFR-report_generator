@@ -57,18 +57,3 @@ The tool's architecture consists of several AWS services working together:
 - **S3 Buckets**: Hosts the report template, stores the generated CSV and Word document reports.
 - **SNS**: Sends notifications with presigned URLs to access the generated reports.
 
-## Customization
-
-You can customize the report generation logic, template, and notification contents by modifying the Lambda function code and the Word document template as needed.
-
-## Security
-
-Ensure appropriate IAM permissions are set to restrict access to the resources created by this tool. Use S3 bucket policies and presigned URLs to control access to the generated reports.
-
-## Cleanup
-
-To avoid incurring future charges, delete the CloudFormation stack, which will remove the resources created by this tool. Remember to manually remove any objects from the S3 buckets if they are not deleted by the stack removal.
-
-## Support
-
-For issues or enhancements, please refer to the project's GitHub repository or contact the project maintainer.
