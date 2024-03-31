@@ -4,7 +4,7 @@ The Well-Architected Report Generation Tool is a serverless solution designed to
 
 ## Architectural Overview
 
-[Well-Architected-Custom-Report.pdf](https://github.com/jacklavelle286/WAFR-report_generator/files/14817783/Well-Architected-Custom-Report.pdf)
+![Slide1](https://github.com/jacklavelle286/WAFR-report_generator/assets/78485499/700cc44a-aa9d-47cb-acb3-f174cf8a5a5a)
 
 ## Overview
 
